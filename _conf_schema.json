@@ -1,10 +1,11 @@
 {
   "provider": {
     "description": "模型提供商（siliconflow / openrouter / modelscope / gemini-image / doubao / custom）",
+    "hint": "必须先在这里选中要用的 provider，插件才会去读对应的那一组配置。例如用自定义接口时必须选 custom，只填下面的「自定义 OpenAI Images 接口配置」而不选这里是不会生效的。",
     "type": "string",
     "options": ["siliconflow", "openrouter", "modelscope", "gemini-image", "doubao", "custom"],
     "default": "siliconflow",
-    "invisible": true
+    "obvious_hint": true
   },
 
   "save_dir": {
@@ -156,10 +157,10 @@
     "type": "object",
     "items": {
       "base_url": {
-      "description": "仅 provider=custom 时使用；必须是完整 /v1/images/generations 接口地址",
+        "description": "仅 provider=custom 时使用；接口地址（完整端点、/v1 前缀或域名都可以，插件会自动补齐 /v1/images/generations）",
         "type": "string",
         "default": "",
-      "hint": "例如：https://your.host/v1/images/generations"
+        "hint": "例如：https://your.host/v1/images/generations 或 https://your.host/v1 或 https://your.host"
       },
       "api_key": {
         "description": "自定义 Provider 的 API Key（Bearer ...）",

@@ -28,5 +28,10 @@
 
 ## 自定义 Provider
 
-- 将 `provider` 设为 `custom`，配上自定义的 `base_url` 与 `api_key`；只要遵循 OpenAI 风格的 `/images/generations` JSON 即可（字段见 `adapters/*.py`）。
+- **先把配置顶部的 `provider` 下拉框切成 `custom`**（这一步最容易漏；只填下面的「自定义 OpenAI Images 接口配置」而不切 provider 是不会生效的）。
+- 然后在「自定义 OpenAI Images 接口配置」里填 `base_url`、`api_key`、`model`：
+  - `base_url` 可以填完整端点 `https://your.host/v1/images/generations`，也可以只填 `https://your.host/v1` 或 `https://your.host`，插件会自动补齐 `/v1/images/generations`；
+  - 只要对方遵循 OpenAI 风格的 `/images/generations` JSON 即可（字段见 `adapters/custom_http.py`）。
+- 也可以在聊天里用 `/imgprovider custom` 切换，`/imgprovider` 不带参数会列出各 provider 是否已填 api_key。
+- 若配置里的 `provider` 仍是默认值、而只有一个分组填了 api_key，插件会自动使用那个分组，并打印一条 warning 提示。
 

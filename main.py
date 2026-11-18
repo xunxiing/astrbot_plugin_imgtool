@@ -20,6 +20,20 @@ from .tools import ImagineTool
 
 PLUGIN_ID = "astrbot_plugin_imgtool"
 
+# 所有受支持的 provider（必须与 _conf_schema.json 里的 options 保持一致）
+_PROVIDERS = ("siliconflow", "openrouter", "modelscope", "gemini-image", "doubao", "custom")
+# WebUI 中每个 provider 对应配置分组的标题，用于把报错说清楚
+_PROVIDER_LABELS = {
+    "siliconflow": "SiliconFlow 图像生成配置",
+    "openrouter": "OpenRouter 图像生成配置",
+    "modelscope": "ModelScope 图像生成配置",
+    "gemini-image": "Google Gemini 图像生成配置",
+    "doubao": "Doubao 即梦（Seedream）图像生成配置",
+    "custom": "自定义 OpenAI Images 接口配置",
+}
+# 这些顶层平铺键由 _prepare_flat_config_for_provider 按当前 provider 重新写入
+_FLAT_KEYS = ("api_key", "model", "edit_model", "base_url", "openrouter_referer", "openrouter_title")
+
 
 def _find_data_root(start_dir: str) -> str:
     """尽量将持久化文件放到 AstrBot/data 下；找不到就退回到插件目录的 _data。"""
@@ -47,6 +61,8 @@ class ImgToolPlugin(Star):
         self.save_dir = os.path.join(self.data_root, self.config.get("save_dir", "images/astrbot_plugin_imgtool"))
         os.makedirs(self.save_dir, exist_ok=True)
         logger.info(f"[{PLUGIN_ID}] save_dir = {self.save_dir}")
+        # 当前实际生效的 provider（可能与配置里的 provider 不同，见 _prepare_flat_config_for_provider）
+        self._active_provider: str = ""
 
         # 迁移旧版平铺配置到按 provider 分组的配置里（兼容已有用户）
         try:
@@ -174,37 +190,99 @@ class ImgToolPlugin(Star):
 
     # ------------- 公共工具方法 -------------
     def _current_provider(self) -> str:
-        return (self.config.get("provider") or "siliconflow").lower()
+        raw = (self.config.get("provider") or "").strip().lower()
+        if raw in _PROVIDERS:
+            return raw
+        if raw:
+            logger.warning(
+                f"[{PLUGIN_ID}] 未知 provider={raw!r}，可选值：{', '.join(_PROVIDERS)}；已回退为 siliconflow。"
+            )
+        return "siliconflow"
 
     def _get_provider_config(self, provider: str | None = None) -> dict:
         if provider is None:
             provider = self._current_provider()
-        cfg = self.config.get(provider) or {}
-        return cfg if isinstance(cfg, dict) else {}
+        cfg = self.config.get(provider)
+        if cfg is None:
+            # 兼容 siliconflow / silicon-flow 这类写法差异
+            alt = provider.replace("-", "_") if "-" in provider else provider.replace("_", "-")
+            cfg = self.config.get(alt)
+        if cfg is None:
+            return {}
+        if isinstance(cfg, dict):
+            return cfg
+        try:
+            return dict(cfg)  # 兼容 AstrBotConfig 等映射对象
+        except Exception:
+            return {}
 
-    def _prepare_flat_config_for_provider(self, provider: str | None = None) -> None:
-        """将按 provider 分组的配置摊平到顶层，兼容旧版读取方式。"""
-        if provider is None:
-            provider = self._current_provider()
+    def _section_value(self, provider: str, key: str) -> str:
+        """读取某个 provider 分组里的字符串配置，去掉首尾空白；空值统一返回 ""。"""
         cfg = self._get_provider_config(provider)
-        if not isinstance(cfg, dict) or not cfg:
-            return
+        val = cfg.get(key)
+        if val is None:
+            return ""
+        if isinstance(val, str):
+            return val.strip()
+        return str(val).strip()
 
-        def _set_if_present(key: str, cfg_key: str | None = None) -> None:
-            k = cfg_key or key
-            if k in cfg and cfg[k] not in (None, ""):
-                self.config[key] = cfg[k]
+    def _resolve_provider(self, preferred: str | None = None) -> str:
+        """确定实际生效的 provider。
 
-        _set_if_present("api_key")
-        _set_if_present("model")
-        _set_if_present("edit_model")
-        if provider == "custom":
-            _set_if_present("base_url")
-        if provider == "gemini-image":
-            _set_if_present("base_url")
-        if provider == "openrouter":
-            _set_if_present("openrouter_referer", "referer")
-            _set_if_present("openrouter_title", "title")
+        典型场景：配置文件里 provider 仍是默认的 siliconflow，但用户只在
+        custom 分组里填了 api_key —— 此时自动改用唯一一个填了 api_key 的
+        provider，避免出现「明明填了 key 却提示没填」。
+        """
+        provider = preferred.strip().lower() if isinstance(preferred, str) else ""
+        if provider not in _PROVIDERS:
+            provider = self._current_provider()
+        if self._section_value(provider, "api_key"):
+            return provider
+        configured = [p for p in _PROVIDERS if p != provider and self._section_value(p, "api_key")]
+        if len(configured) == 1:
+            logger.warning(
+                f"[{PLUGIN_ID}] provider={provider} 的 {provider}.api_key 未填写，"
+                f"自动改用唯一已配置的 provider={configured[0]}（建议在 WebUI 里把 provider 改成它）。"
+            )
+            return configured[0]
+        if len(configured) > 1:
+            logger.warning(
+                f"[{PLUGIN_ID}] provider={provider} 的 {provider}.api_key 未填写，"
+                f"而 {', '.join(configured)} 都填了 key，无法自动判断，仍按 {provider} 处理。"
+            )
+        return provider
+
+    def _prepare_flat_config_for_provider(self, provider: str | None = None) -> str:
+        """将按 provider 分组的配置摊平到顶层，兼容旧版读取方式。
+
+        返回实际生效的 provider 名称。
+        """
+        provider = self._resolve_provider(provider)
+
+        cfg = self._get_provider_config(provider)
+        # 先清掉受管的平铺键，避免上一个 provider 的残留值被误用
+        for k in _FLAT_KEYS:
+            if k in self.config:
+                self.config[k] = ""
+        if cfg:
+            def _set_if_present(key: str, cfg_key: str | None = None) -> None:
+                k = cfg_key or key
+                v = cfg.get(k)
+                if isinstance(v, str):
+                    v = v.strip()
+                if v not in (None, ""):
+                    self.config[key] = v
+
+            _set_if_present("api_key")
+            _set_if_present("model")
+            _set_if_present("edit_model")
+            if provider in {"custom", "gemini-image", "doubao"}:
+                _set_if_present("base_url")
+            if provider == "openrouter":
+                _set_if_present("openrouter_referer", "referer")
+                _set_if_present("openrouter_title", "title")
+        self._active_provider = provider
+        return provider
 
     def _migrate_legacy_config(self) -> None:
         """把旧版全局配置转换为按 provider 分组的配置。"""
@@ -249,7 +327,7 @@ class ImgToolPlugin(Star):
 
     # ------------- 公共工具方法 -------------
     def _pick_adapter(self) -> ImageProviderAdapter:
-        return get_adapter(self._current_provider())
+        return get_adapter(self._active_provider or self._current_provider())
 
     def _platform_url_only(self, event: AstrMessageEvent) -> bool:
         # 钉钉仅支持 URL 图（其他平台多数均支持本地文件 & URL）。
@@ -313,14 +391,18 @@ class ImgToolPlugin(Star):
         if not prompt or not prompt.strip():
             return event.plain_result("提示词为空。")
 
-        provider = self._current_provider()
-        self._prepare_flat_config_for_provider(provider)
-        api_key = self.config.get("api_key", "").strip()
+        provider = self._prepare_flat_config_for_provider()
+        api_key = (self.config.get("api_key") or "").strip()
         if not api_key:
-            return event.plain_result("请先在插件配置中填写 api_key。")
+            label = _PROVIDER_LABELS.get(provider, provider)
+            return event.plain_result(
+                f"未找到 api_key：当前生效的 provider 是 {provider}，"
+                f"而配置项 {provider}.api_key 为空。\n"
+                f"请在插件配置的「{label}」分组里填写 API Key；"
+                f"如果你用的是别的分组，请先把顶部的 provider 切换成对应的那一项。"
+            )
 
-        provider = (self.config.get("provider") or "siliconflow").lower()
-        # 交给各 adapter 决定默认 base_url；仅 custom 严格校验完整端点（你的原始约束保留）
+        # 交给各 adapter 决定默认 base_url；custom 只要求填了地址，具体端点由适配器补齐
         extra_headers = None
         if provider == "openrouter":
             extra_headers = {}
@@ -330,12 +412,14 @@ class ImgToolPlugin(Star):
             if ttl: extra_headers["X-Title"] = ttl
         base_url = (self.config.get("base_url") or "").strip()
         if provider == "custom":
-            b = base_url.rstrip("/")
-            if not b or (not b.endswith("/images/generations")):
-                return event.plain_result("base_url 必须以 /v1/images/generations 结尾（完整接口地址）。")
-        # siliconflow/openrouter 留空 base_url 让各自 adapter 用默认
-        if provider in {"siliconflow", "openrouter"}:
-            base_url = base_url  # 可以留空，adapter 会兜底
+            if not base_url:
+                return event.plain_result(
+                    "当前 provider=custom，但 base_url 为空。\n"
+                    "请在「自定义 OpenAI Images 接口配置」中填写接口地址，"
+                    "例如 https://your.host/v1/images/generations（填 https://your.host/v1 或域名也可以，插件会自动补全）。"
+                )
+            # 允许只填域名/ /v1 前缀，最终补齐交给 OpenAIImagesAdapter 处理
+            logger.info(f"[imgtool] custom base_url={base_url}")
 
         if not model:
             model = (self.config.get("model") or "Qwen/Qwen-Image").strip()
@@ -401,12 +485,17 @@ class ImgToolPlugin(Star):
         带参数：切换 provider 并保存配置（同时保留各自的 api_key 和模型配置）。
         """
         provider = (provider or "").strip().lower()
-        valid = ["siliconflow", "openrouter", "modelscope", "gemini-image", "custom"]
+        valid = list(_PROVIDERS)
 
         if not provider:
             current = self._current_provider()
-            choices = ", ".join(valid)
-            yield event.plain_result(f"当前文生图 provider：{current}\n可选：{choices}")
+            lines = [f"当前文生图 provider：{current}（配置项 provider）"]
+            for p in valid:
+                has_key = "✅ 已配置 api_key" if self._section_value(p, "api_key") else "❌ 未配置 api_key"
+                mark = "→" if p == current else "  "
+                lines.append(f"{mark} {p}: {has_key}")
+            lines.append("用法：/imgprovider custom 切换；也可以直接在 WebUI 插件配置顶部的 provider 下拉框里改。")
+            yield event.plain_result("\n".join(lines))
             return
 
         if provider not in valid:
@@ -464,8 +553,7 @@ class ImgToolPlugin(Star):
             image3(string): 参考图3（仅 Qwen-Image-Edit-2509）
             use_refs(boolean): 是否自动使用本条消息里的图片/被引用消息里的图片作为参考图
         """
-        provider = self._current_provider()
-        self._prepare_flat_config_for_provider(provider)
+        provider = self._prepare_flat_config_for_provider()
         # 1) 解析最终要用的模型名（如果函数参数没给，就用配置里的）
         final_model = (model or self.config.get("model") or "Qwen/Qwen-Image").strip()
         # 允许使用别名：例如传入 "edit" 自动映射为配置的编辑模型
