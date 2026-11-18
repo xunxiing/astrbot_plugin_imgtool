@@ -68,15 +68,76 @@ class OpenAIImagesAdapter(ImageProviderAdapter):
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(url, headers=headers, json=payload) as resp:
                 txt = await resp.text()
-                if resp.status >= 400:
-                    raise RuntimeError(f"HTTP {resp.status} when POST {url}: {txt}")
-                data = json.loads(txt)
+                status = resp.status
+        if status >= 400:
+            # 尽量把服务端返回的错误信息提取出来，方便定位
+            detail = txt
+            try:
+                err = json.loads(txt)
+                if isinstance(err, dict):
+                    e = err.get("error")
+                    if isinstance(e, dict):
+                        detail = e.get("message") or e.get("code") or txt
+                    elif isinstance(e, str):
+                        detail = e
+                    elif err.get("message"):
+                        detail = err["message"]
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP {status} when POST {url}: {detail[:800]}")
+
+        try:
+            data = json.loads(txt)
+        except Exception:
+            raise RuntimeError(
+                f"接口 {url} 返回的不是 JSON（前 300 字符）：{txt[:300]}"
+            )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"接口 {url} 返回格式不是对象：{str(data)[:300]}")
 
         urls: List[str] = []
-        for item in (data.get("images") or data.get("data") or []):
-            if isinstance(item, dict):
-                u = item.get("url")
-                if u: urls.append(u)
-                if not u and "b64_json" in item:
-                    urls.append(f"data:image/png;base64,{item['b64_json']}")
+        items = data.get("images")
+        if items is None:
+            items = data.get("data")
+        if isinstance(items, dict):
+            items = [items]
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, str) and item:
+                    urls.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                u = item.get("url") or item.get("image_url")
+                if isinstance(u, str) and u:
+                    urls.append(u)
+                    continue
+                urls.extend(_b64_to_data_url(item))
+        # 少数接口把单张图直接放在顶层
+        if not urls:
+            urls.extend(_b64_to_data_url(data))
+            top_url = data.get("url")
+            if isinstance(top_url, str) and top_url:
+                urls.append(top_url)
+
+        if not urls:
+            # 200 但没解析到图片，把返回内容回显出来，避免只提示「已生成 0 张图」
+            err = data.get("error") or data.get("message") or txt
+            raise RuntimeError(f"接口 {url} 未返回图片（返回内容）：{str(err)[:500]}")
         return urls, data
+
+
+def _b64_to_data_url(item: Dict) -> List[str]:
+    """把 b64_json / base64 / image 等字段统一转成 data URL。"""
+    out: List[str] = []
+    for key in ("b64_json", "base64", "image_base64", "image"):
+        v = item.get(key)
+        if not isinstance(v, str) or not v:
+            continue
+        if v.startswith("data:image/"):
+            out.append(v)
+            continue
+        if key == "b64_json" or len(v) > 256:
+            out.append(f"data:image/png;base64,{v}")
+            break
+    return out
