@@ -5,6 +5,9 @@ from .custom_http import OpenAIImagesAdapter
 
 
 class SiliconFlowAdapter(OpenAIImagesAdapter):
+    # 内置 provider：base_url 允许只填到 /v1，由适配器补齐 /images/generations
+    require_full_endpoint = False
+
     async def generate_image(self, **kwargs):
         # 默认端点：忽略空 base_url
         if not kwargs.get("base_url"):
